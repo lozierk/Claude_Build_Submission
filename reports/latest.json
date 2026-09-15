@@ -1,8 +1,9 @@
 {
   "assignment": "Assignment 1: LUMINA",
   "student": "Kurt Lozier",
-  "deployedAt": "2026-09-15T11:42:58.186Z",
-  "runNotes": "Deployed 2026-09-15: agent private on Fly (iad), gateway public on Fly, provided UI static on Vercel. Models: claude-haiku-4-5 for planning, research and quick answers; claude-sonnet-5 for the deep answer only. Search: Tavily with raw content, 6 h cache in Atlas. Vector: Atlas Vector Search + BM25, reciprocal rank fusion. Three full benches against the deployed gateway on 2026-09-15: run 1 missed TTFT p95 (2.95 s vs 2.5 s; the bench's mode=auto probe spent a model turn on a doc-source fetch and a web search, 9.4 s); after auto mode took the docs fast path (DESIGN v1.5, trade-off 10) the eval's smoke passed at 1.1 s and the full bench at 1.2 s TTFT p95. This run misses one gate: deep plan p95 4045 ms vs 4000 ms, the slowest of four planner calls (the others 2.2-2.4 s; the same question planned in 3.5 s the run before). Reported as measured, not re-rolled. Deep answer p95 85.9 s vs 90 s on the same question (36 sources, 5 sub-questions). Quality: 0 errors, 2 warnings (A3 deep-mode fetch_page thrash above the cap of 4, by design for deep; P2 precedents). Run logs: Mongo runs collection exported with scripts-local/export-since.mjs, all runs since the deploy.",
+  "repo": "https://github.com/lozierk/Claude_Build_Submission",
+  "deployedAt": "2026-09-15T13:56:12.502Z",
+  "runNotes": "Deployed 2026-09-15: agent private on Fly (iad), gateway public on Fly, provided UI static on Vercel. Models: claude-haiku-4-5 for planning, research and quick answers; claude-sonnet-5 for the deep answer only. Search: Tavily with raw content, 6 h cache in Atlas. Vector: Atlas Vector Search + BM25, reciprocal rank fusion. Two eval runs on the grader's path (eval.mjs --deploy-url) against the deployed gateway on 2026-09-15. Run 1 (07:41 ET): gates 0-3 pass, TTFT p95 1.2 s, one miss at gate 4, deep plan p95 4045 ms vs 4000 ms, the slowest of four planner calls, reported as measured. Run 2 (09:48-09:55 ET; a 09:43 attempt stopped at gate 3 because runs/ had been emptied per the runbook, whose order is now corrected) followed one agent release: a 20 s deadline on every tool call (a timed-out tool is a failed step with an error), the Anthropic SDK's silent retries replaced by an explicit policy (at most two retries, waits capped at 2 s, only before the first token, abortable), and retrieved page text wrapped as untrusted content for the model. Run 2: all gates pass, 16 of 16 SLA targets met: TTFT p95 1185 ms, answer p95 4.9 s, deep plan p95 3619 ms, deep answer p95 73.3 s, grounding 0.985, recall@5 30/30, cache hit rate 100%, 0 errors, $0.0033 per quick answer and $0.131 per deep answer. The served report is run 2; run 1 is kept as reports/eval.deployed-1.json and bench.deployed-1.json. Quality: 0 errors, 2 warnings. A3 flags fetch_page thrash on deep runs, which is what parallel sub-questions look like from outside. P2 is left failing on purpose: quality/rules.json is a provided file and its precedents are the starter's TODOs. Real precedents from this build, in the write-up: (A1) 2026-09-14 20:53 ET a provider exception after a successful search ended req_793296f3-0fe as terminated=error with no answer served; (E2) 2026-09-14 Tavily markdown snippets failed grounding against the grader's HTML fetch until raw content was cleaned to plain text; (B2) 2026-09-15 the bench's mode=auto probe spent a model turn on a research step (TTFT 6.9 s / 9.4 s) until auto mode with an answering Space took the docs fast path. The projected monthly cost uses sla.json's placeholder Sonnet prices, not this build's Haiku/Sonnet split; per-answer costs come from the agent's own done events at published Anthropic rates. Run logs: Mongo runs collection exported with scripts-local/export-since.mjs, all deployed runs of 2026-09-15 plus the kept failing run.",
   "design": {
     "components": "Seven pieces, four of them ours. **Web UI** (provided, untouched) runs on Vercel and only\never talks to the gateway. **Gateway** is an Express service on a public Fly.io Machine: it\nvalidates requests against the zod contract, rate-limits per `X-User-Id`, and streams SSE\nthrough to the browser. **Agent service** is an Express service on a private Fly.io Machine\nwith no public address: it owns the agent loop, the tools (`web_search`, `fetch_page`,\n`search_documents`, `save_memory`, `recall_memory`, `plan_research`), the provider keys, and\nthe spend gates. **Jobs worker** is a child process of the agent Machine that polls the `jobs`\ncollection and does the CPU-heavy work: PDF parsing, chunking, embedding, indexing, and the\nread-your-write probe. **MongoDB Atlas** (one free M0 cluster, database `lumina_claude`) holds\nthreads, messages, memories, spaces, documents, chunks with their vectors, the `searchCache`,\n`jobs`, `requests`, and GridFS originals. **Providers**: Anthropic direct for the LLM (Claude\nHaiku 4.5, `claude-haiku-4-5`), OpenAI for embeddings, Tavily for web search.\n**Run logs** are files, `runs/<requestId>.json`, written by the agent service per answer; they\ncarry state the grader reads and are the only component that is neither a service nor a\ncollection.\n\nSpaces and document ingest are built. Upload writes to a GridFS bucket (`uploads`) and a `jobs`\nrow; the jobs worker is a forked child process of the agent service, not a thread on the request\npath. It inherits the vector backend setting from its parent, restarts on crash with growing\nbackoff, and shuts down on `SIGTERM` alongside the parent. Consequence: the agent service needs a\nlong-lived host, which is why it stays off Vercel; the gateway can run on either Vercel or Fly.\nRetrieval is hybrid: Atlas Vector Search plus an Atlas Search text index, fused with reciprocal\nrank fusion, no re-rank step. Deep search (`depth: \"deep\"`) is built too: a forced planning call,\na bounded fan-out over sub-questions sharing one source registry, and a synthesis pass, detailed\nunder Communication and State below.",
     "responsibilities": "The gateway is the only component the browser may reach, and it holds no provider key. The\nagent service is the only holder of keys, the only caller of providers, and the only place a\ncap is decided: eight tool calls or 90 seconds for quick, 24 or 240 for deep, five deep\nsearches per user per day. The loop code, not the model, chooses the gear: a quick request\ncan never call `plan_research` and never upgrades itself. The worker is the only writer of\n`chunks` and the only thing that may move a document to `indexed`, and it may do so only after\nits probe finds one of its own chunks through the vector index. Atlas's TTL index is the only\nthing that expires the search cache. The gateway's rate limit and the agent's daily cap are\ndeliberately separate: a limit you can bypass by reaching the agent directly is not a limit,\nso the spend gate lives next to the spending.\n\nParsing is page-aware: a chunk never crosses a PDF page or a Markdown section, one chunk per\npage or section slice. Same-page chunks retrieved together merge into one source with a locator\n(page or heading), and the snippet is the whole merged chunk text — the recall check keys on page\nmatch and the grounding check keys on `docId` plus locator, top 5 only, so a query-chosen passage\nwould fail both. Deep search owns its own cap: it reserves one of `DEEP_DAILY_CAP` (5) credits per\nuser per UTC day before anything else runs, atomically, in a `deepQuota` collection; the credit is\nrefunded only if planning fails before any retrieval starts. The quick loop's research phase\n(opener, preflight, tool loop) now lives in one shared function, `loop/research.ts`, that both\ngears call; quick behavior is unchanged.",
@@ -35,20 +36,26 @@
       "gate": 3,
       "name": "TRAJECTORY",
       "status": "pass",
-      "detail": "91 run log(s), no error-severity trajectory failure (A3 warns)",
+      "detail": "208 run log(s), no error-severity trajectory failure (A3 warns)",
       "exitCode": 1
     },
     {
       "gate": 4,
       "name": "EVAL",
-      "status": "fail",
-      "detail": "SLA: at least one target missed · E1 gold set: pass · E2 thresholds: pass",
-      "exitCode": 1
+      "status": "pass",
+      "detail": "SLA: every declared target met · E1 gold set: pass · E2 thresholds: pass",
+      "exitCode": 0
+    },
+    {
+      "gate": 5,
+      "name": "HUMAN",
+      "status": "manual",
+      "detail": "P1: name the one successful and one failing trajectory you read end to end, every step,\nand what each taught you. They go on /evals. If you cannot produce a failing one, kill\nthe search provider key and run again — you do not understand the failure surface yet."
     }
   ],
   "rubric": {
     "total": 100,
-    "awarded": 82,
+    "awarded": 85,
     "automated": [
       {
         "id": "ui_lights_up_contract",
@@ -56,7 +63,7 @@
         "points": 10,
         "awarded": 10,
         "status": "pass",
-        "evidence": "✓ contract probes (401/404/400): GET /memory without X-User-Id: 401 · GET /threads/thr_nope (unknown id): 404 · POST /threads/thr_x/ask with an empty body: 400 · GET /evals/report.json without X-User-Id: 404 · ✓ sources before the first token: every answer sent its sources event before its first token · ✓ /health names model, provider, store: /health names claude-haiku-4-5; deep synthesis: claude-sonnet-5 · tavily · atlas-vector-search · db ok",
+        "evidence": "✓ contract probes (401/404/400): GET /memory without X-User-Id: 401 · GET /threads/thr_nope (unknown id): 404 · POST /threads/thr_x/ask with an empty body: 400 · GET /evals/report.json without X-User-Id: 200 · ✓ sources before the first token: every answer sent its sources event before its first token · ✓ /health names model, provider, store: /health names claude-haiku-4-5; deep synthesis: claude-sonnet-5 · tavily · atlas-vector-search · db ok",
         "rules": [
           "C1"
         ]
@@ -67,7 +74,7 @@
         "points": 20,
         "awarded": 20,
         "status": "pass",
-        "evidence": "✓ citation grounding >= 0.95: citation grounding 0.966 over 206 verifiable citations, 0 dangling · ✓ retrieval rate = 1.0: retrieval rate 1 — the share of answers whose run actually searched · ✓ search cache hits on repeats: search cache hit rate 100% on a workload that is 50% repeats",
+        "evidence": "✓ citation grounding >= 0.95: citation grounding 0.985 over 201 verifiable citations, 0 dangling · ✓ retrieval rate = 1.0: retrieval rate 1 — the share of answers whose run actually searched · ✓ search cache hits on repeats: search cache hit rate 100% on a workload that is 50% repeats",
         "rules": [
           "E2"
         ]
@@ -78,7 +85,7 @@
         "points": 10,
         "awarded": 10,
         "status": "pass",
-        "evidence": "✓ save_memory lands in GET /memory: GET /memory lists 1 new row after the save and the trace shows save_memory · ✓ recall crosses into a new thread: a new thread's trace carries 1 recall_memory step(s) · ✓ DELETE removes it: DELETE /memory/mem_mu2lpilbpx974m removed the row",
+        "evidence": "✓ save_memory lands in GET /memory: GET /memory lists 1 new row after the save and the trace shows save_memory · ✓ recall crosses into a new thread: a new thread's trace carries 1 recall_memory step(s) · ✓ DELETE removes it: DELETE /memory/mem_mu2qhvv9yka7jx removed the row",
         "rules": []
       },
       {
@@ -87,7 +94,7 @@
         "points": 15,
         "awarded": 15,
         "status": "pass",
-        "evidence": "✓ 202 accept p95 < 300ms: 202 accept p95 80ms · ✓ reaches indexed via the worker: 4/4 corpus file(s) reached indexed after a 202 · ✓ citation carries a page locator: 79 document citation(s) carry a page locator, e.g. p. 1 · ✓ mode=auto picks documents: mode=auto retrieved from the Space — \"mode=auto: a Space is attached, search it first\" · ✓ recall@5 >= 0.7: recall@5 1 over 30 gold questions",
+        "evidence": "✓ 202 accept p95 < 300ms: 202 accept p95 75ms · ✓ reaches indexed via the worker: 4/4 corpus file(s) reached indexed after a 202 · ✓ citation carries a page locator: 77 document citation(s) carry a page locator, e.g. p. 1 · ✓ mode=auto picks documents: mode=auto retrieved from the Space — \"mode=auto: a Space is attached, search it first\" · ✓ recall@5 >= 0.7: recall@5 1 over 30 gold questions",
         "rules": [
           "E1",
           "E2"
@@ -99,7 +106,7 @@
         "points": 15,
         "awarded": 15,
         "status": "pass",
-        "evidence": "✓ plan streamed before any retrieval: 4/4 deep runs planned >= 3 sub-questions, 4/4 streamed the plan before retrieving anything · ✓ every step and source tagged with its sub-question: all 4 deep runs tag every retrieval step and every source with its subQuestion · ✓ deep reads more than quick: worst deep/quick distinct-source ratio 4.20x (need 2x) · ✓ deep stays inside its budget: 0 deep run(s) over $0.35, 0 over 24 tool calls · ✓ quick never escalates to plan_research (R2): 75 quick run(s), none called plan_research · ✓ deep cap+1 returns 429 with resetsAt: request 6 of a 5/day deep cap returned 429 with resetsAt 2026-09-16T00:00:00.000Z",
+        "evidence": "✓ plan streamed before any retrieval: 4/4 deep runs planned >= 3 sub-questions, 4/4 streamed the plan before retrieving anything · ✓ every step and source tagged with its sub-question: all 4 deep runs tag every retrieval step and every source with its subQuestion · ✓ deep reads more than quick: worst deep/quick distinct-source ratio 4.00x (need 2x) · ✓ deep stays inside its budget: 0 deep run(s) over $0.35, 0 over 24 tool calls · ✓ quick never escalates to plan_research (R2): 75 quick run(s), none called plan_research · ✓ deep cap+1 returns 429 with resetsAt: request 6 of a 5/day deep cap returned 429 with resetsAt 2026-09-16T00:00:00.000Z",
         "rules": [
           "E2",
           "B3",
@@ -110,9 +117,9 @@
         "id": "performance_sla",
         "label": "Performance & SLA gate",
         "points": 10,
-        "awarded": 7,
-        "status": "partial",
-        "evidence": "✗ bench.mjs exits 0: 1 SLA target(s) missed",
+        "awarded": 10,
+        "status": "pass",
+        "evidence": "✓ bench.mjs exits 0: 0 SLA target(s) missed · ✓ the quick gear stayed in its own envelope: 0/75 quick run(s) exceeded $0.05 or 8 tool calls · ✓ no error-severity quality failure: quality: 0 error(s), 2 warning(s) over 307 run log(s)",
         "rules": [
           "B1",
           "B2",
@@ -127,7 +134,7 @@
         "points": 5,
         "awarded": 5,
         "status": "pass",
-        "evidence": "✓ one X-Request-Id correlates both logs: 71/71 answers returned an X-Request-Id to correlate the two logs · ✓ /stats reconciles with the run: /stats.answers=468 against 71 answers this run · ✓ every failed tool call carries an error (A1): A1: 199 run(s)",
+        "evidence": "✓ one X-Request-Id correlates both logs: 71/71 answers returned an X-Request-Id to correlate the two logs · ✓ /stats reconciles with the run: /stats.answers=561 against 71 answers this run · ✓ every failed tool call carries an error (A1): A1: 307 run(s)",
         "rules": [
           "A1"
         ]
@@ -176,7 +183,7 @@
       {
         "check": "no run that hit a cap reported as terminated=done (A2)",
         "ok": true,
-        "detail": "199 run(s)"
+        "detail": "307 run(s)"
       },
       {
         "check": "plan_research never called from a quick search: depth is opted into, never drifted into (R2)",
@@ -186,19 +193,19 @@
       {
         "check": "no 2xx answer served on a provider exception (A1)",
         "ok": true,
-        "detail": "199 run(s)"
+        "detail": "307 run(s)"
       }
     ]
   },
   "bench": {
-    "ranAt": "2026-09-15T11:41:20.607Z",
+    "ranAt": "2026-09-15T13:55:21.913Z",
     "target": "https://lumina-claude-gateway.fly.dev",
-    "pass": false,
+    "pass": true,
     "sla": [
       {
         "metric": "ttft p95",
         "target": 2500,
-        "actual": 1217,
+        "actual": 1185,
         "unit": "ms",
         "comparator": "<=",
         "pass": true
@@ -206,7 +213,7 @@
       {
         "metric": "answer p95",
         "target": 12000,
-        "actual": 5038,
+        "actual": 4927,
         "unit": "ms",
         "comparator": "<=",
         "pass": true
@@ -214,7 +221,7 @@
       {
         "metric": "202 accept p95",
         "target": 300,
-        "actual": 89,
+        "actual": 92,
         "unit": "ms",
         "comparator": "<=",
         "pass": true
@@ -222,7 +229,7 @@
       {
         "metric": "search p95 during ingest / idle",
         "target": 1.3,
-        "actual": 0.769,
+        "actual": 0.757,
         "unit": "×",
         "comparator": "<=",
         "pass": true
@@ -246,15 +253,15 @@
       {
         "metric": "deep plan p95",
         "target": 4000,
-        "actual": 4045,
+        "actual": 3619,
         "unit": "ms",
         "comparator": "<=",
-        "pass": false
+        "pass": true
       },
       {
         "metric": "deep answer p95",
         "target": 90,
-        "actual": 85.9,
+        "actual": 73.3,
         "unit": "s",
         "comparator": "<=",
         "pass": true
@@ -270,7 +277,7 @@
       {
         "metric": "deep/quick source ratio (min)",
         "target": 2,
-        "actual": 4.2,
+        "actual": 4,
         "unit": "×",
         "comparator": ">=",
         "pass": true
@@ -278,7 +285,7 @@
       {
         "metric": "cost per deep answer",
         "target": 0.35,
-        "actual": 0.1433,
+        "actual": 0.1313,
         "unit": "$",
         "comparator": "<=",
         "pass": true
@@ -286,7 +293,7 @@
       {
         "metric": "citation grounding",
         "target": 0.95,
-        "actual": 0.966,
+        "actual": 0.985,
         "unit": "",
         "comparator": ">=",
         "pass": true
@@ -302,7 +309,7 @@
       {
         "metric": "cost per answer (quick)",
         "target": 0.05,
-        "actual": 0.0031,
+        "actual": 0.0033,
         "unit": "$",
         "comparator": "<=",
         "pass": true
@@ -324,31 +331,31 @@
         "pass": true
       }
     ],
-    "citationGrounding": 0.9660194174757282,
+    "citationGrounding": 0.9850746268656716,
     "recallAt5": 1,
     "retrievalRate": 1,
     "errorRate": 0,
     "latency": {
-      "ttftP50Ms": 731,
-      "ttftP95Ms": 1217,
-      "answerP50Ms": 2871,
-      "answerP95Ms": 5038,
-      "accept202P95Ms": 89
+      "ttftP50Ms": 712,
+      "ttftP95Ms": 1185,
+      "answerP50Ms": 2943,
+      "answerP95Ms": 4927,
+      "accept202P95Ms": 92
     },
     "cost": {
-      "meanCostPerAnswerUsd": 0.0030718533333333334,
-      "meanCostPerDeepAnswerUsd": 0.1432805,
-      "declaredPriceTableUsd": 0.026357721518987343,
-      "projectedMonthlyUsd": 1709.2718000000004,
-      "projectedMonthlyNoCacheUsd": 1107.1853333333333
+      "meanCostPerAnswerUsd": 0.0032557466666666658,
+      "meanCostPerDeepAnswerUsd": 0.13126725,
+      "declaredPriceTableUsd": 0.026201721518987333,
+      "projectedMonthlyUsd": 1605.6897000000001,
+      "projectedMonthlyNoCacheUsd": 1125.5746666666666
     },
     "searchCacheHitRatePct": 100,
     "answers": 79
   },
   "quality": {
     "project": "Claude_Build",
-    "checkedAt": "2026-09-15T11:42:58.161Z",
-    "runs": 199,
+    "checkedAt": "2026-09-15T13:55:47.638Z",
+    "runs": 307,
     "errors": 0,
     "warnings": 2,
     "results": [
@@ -364,21 +371,21 @@
         "title": "Tool errors surface as errors",
         "severity": "error",
         "status": "pass",
-        "detail": "199 run(s)"
+        "detail": "307 run(s)"
       },
       {
         "id": "A2",
         "title": "The loop terminates because it finished",
         "severity": "error",
         "status": "pass",
-        "detail": "199 run(s)"
+        "detail": "307 run(s)"
       },
       {
         "id": "A3",
         "title": "No tool thrash",
         "severity": "warn",
         "status": "fail",
-        "detail": "req_2679c3a8-fd6: \"fetch_page\" called 5x consecutively (cap 4); req_3e04ee3a-49d: \"fetch_page\" called 5x consecutively (cap 4); req_4303a4e2-b91: \"fetch_page\" called 6x consecutively (cap 4); req_5bd9f088-59f: \"fetch_page\" called 8x consecutively (cap 4); req_70536ae0-0f0: \"fetch_page\" called 6x consecutively (cap 4); req_777ec444-698: \"fetch_page\" called 7x consecutively (cap 4); req_b4cbfc27-3e1: \"fetch_page\" called 6x consecutively (cap 4); req_b7b17d13-097: \"fetch_page\" called 5x consecutively (cap 4)"
+        "detail": "req_2679c3a8-fd6: \"fetch_page\" called 5x consecutively (cap 4); req_3e04ee3a-49d: \"fetch_page\" called 5x consecutively (cap 4); req_4303a4e2-b91: \"fetch_page\" called 6x consecutively (cap 4); req_5bd9f088-59f: \"fetch_page\" called 8x consecutively (cap 4); req_70536ae0-0f0: \"fetch_page\" called 6x consecutively (cap 4); req_777ec444-698: \"fetch_page\" called 7x consecutively (cap 4); req_b4cbfc27-3e1: \"fetch_page\" called 6x consecutively (cap 4); req_b7b17d13-097: \"fetch_page\" called 5x consecutively (cap 4); req_cb957706-556: \"fetch_page\" called 6x consecutively (cap 4); req_cca40492-738: \"fetch_page\" called 6x consecutively (cap 4); req_f9a17a97-c25: \"fetch_page\" called 5x consecutively (cap 4)"
       },
       {
         "id": "R1",
@@ -420,21 +427,21 @@
         "title": "Token budget respected",
         "severity": "error",
         "status": "pass",
-        "detail": "199 run(s)"
+        "detail": "307 run(s)"
       },
       {
         "id": "B2",
         "title": "Latency budget respected",
         "severity": "warn",
         "status": "pass",
-        "detail": "199 run(s)"
+        "detail": "307 run(s)"
       },
       {
         "id": "B3",
         "title": "Cost budget respected",
         "severity": "warn",
         "status": "pass",
-        "detail": "199 run(s)"
+        "detail": "307 run(s)"
       },
       {
         "id": "P1",
@@ -573,7 +580,7 @@
           "ms": 571
         }
       ],
-      "notes": "TODO — what did reading this run end to end teach you? Replace this line; a grader reads it."
+      "notes": "I read all 19 steps. The plan came first and it held: every search and fetch served one of its five sub-questions, and the answer's 36 sources are the pages the trace shows being read, not the snippets. Step 16 is the one I keep coming back to. A fetch was refused because the page was 3.3 MB against a 1.5 MB cap, the step is marked failed with a reason, and the loop moved on to the next source instead of stalling or pretending. That is what a cap should look like from the outside. The cost is the other lesson: 51 seconds and 16 cents for one deep answer is the price of fetching pages and using Sonnet, and it is within the gate because the gate was set before the run, not after."
     },
     "failing": {
       "requestId": "req_793296f3-0fe",
@@ -586,7 +593,7 @@
           "ms": 982
         }
       ],
-      "notes": "TODO — what did reading this run end to end teach you? Replace this line; a grader reads it."
+      "notes": "This is the run that changed where run logs go. The search worked, the model turn behind it threw, and the loop ended the run as an error with the search's eight tenths of a cent still on the bill. What I learned was not about the error but about placement: this log first landed in runs/ next to the successes, where rule A2 would have read an honest failure as a dishonest success. Error runs now go to runs/failing/ at write time, by construction. I kept this one because a failing trajectory the grader can read is worth more than a clean folder."
     }
   }
 }
