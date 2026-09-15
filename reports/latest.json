@@ -1,0 +1,592 @@
+{
+  "assignment": "Assignment 1: LUMINA",
+  "student": "Kurt Lozier",
+  "deployedAt": "2026-09-15T11:42:58.186Z",
+  "runNotes": "Deployed 2026-09-15: agent private on Fly (iad), gateway public on Fly, provided UI static on Vercel. Models: claude-haiku-4-5 for planning, research and quick answers; claude-sonnet-5 for the deep answer only. Search: Tavily with raw content, 6 h cache in Atlas. Vector: Atlas Vector Search + BM25, reciprocal rank fusion. Three full benches against the deployed gateway on 2026-09-15: run 1 missed TTFT p95 (2.95 s vs 2.5 s; the bench's mode=auto probe spent a model turn on a doc-source fetch and a web search, 9.4 s); after auto mode took the docs fast path (DESIGN v1.5, trade-off 10) the eval's smoke passed at 1.1 s and the full bench at 1.2 s TTFT p95. This run misses one gate: deep plan p95 4045 ms vs 4000 ms, the slowest of four planner calls (the others 2.2-2.4 s; the same question planned in 3.5 s the run before). Reported as measured, not re-rolled. Deep answer p95 85.9 s vs 90 s on the same question (36 sources, 5 sub-questions). Quality: 0 errors, 2 warnings (A3 deep-mode fetch_page thrash above the cap of 4, by design for deep; P2 precedents). Run logs: Mongo runs collection exported with scripts-local/export-since.mjs, all runs since the deploy.",
+  "design": {
+    "components": "Seven pieces, four of them ours. **Web UI** (provided, untouched) runs on Vercel and only\never talks to the gateway. **Gateway** is an Express service on a public Fly.io Machine: it\nvalidates requests against the zod contract, rate-limits per `X-User-Id`, and streams SSE\nthrough to the browser. **Agent service** is an Express service on a private Fly.io Machine\nwith no public address: it owns the agent loop, the tools (`web_search`, `fetch_page`,\n`search_documents`, `save_memory`, `recall_memory`, `plan_research`), the provider keys, and\nthe spend gates. **Jobs worker** is a child process of the agent Machine that polls the `jobs`\ncollection and does the CPU-heavy work: PDF parsing, chunking, embedding, indexing, and the\nread-your-write probe. **MongoDB Atlas** (one free M0 cluster, database `lumina_claude`) holds\nthreads, messages, memories, spaces, documents, chunks with their vectors, the `searchCache`,\n`jobs`, `requests`, and GridFS originals. **Providers**: Anthropic direct for the LLM (Claude\nHaiku 4.5, `claude-haiku-4-5`), OpenAI for embeddings, Tavily for web search.\n**Run logs** are files, `runs/<requestId>.json`, written by the agent service per answer; they\ncarry state the grader reads and are the only component that is neither a service nor a\ncollection.\n\nSpaces and document ingest are built. Upload writes to a GridFS bucket (`uploads`) and a `jobs`\nrow; the jobs worker is a forked child process of the agent service, not a thread on the request\npath. It inherits the vector backend setting from its parent, restarts on crash with growing\nbackoff, and shuts down on `SIGTERM` alongside the parent. Consequence: the agent service needs a\nlong-lived host, which is why it stays off Vercel; the gateway can run on either Vercel or Fly.\nRetrieval is hybrid: Atlas Vector Search plus an Atlas Search text index, fused with reciprocal\nrank fusion, no re-rank step. Deep search (`depth: \"deep\"`) is built too: a forced planning call,\na bounded fan-out over sub-questions sharing one source registry, and a synthesis pass, detailed\nunder Communication and State below.",
+    "responsibilities": "The gateway is the only component the browser may reach, and it holds no provider key. The\nagent service is the only holder of keys, the only caller of providers, and the only place a\ncap is decided: eight tool calls or 90 seconds for quick, 24 or 240 for deep, five deep\nsearches per user per day. The loop code, not the model, chooses the gear: a quick request\ncan never call `plan_research` and never upgrades itself. The worker is the only writer of\n`chunks` and the only thing that may move a document to `indexed`, and it may do so only after\nits probe finds one of its own chunks through the vector index. Atlas's TTL index is the only\nthing that expires the search cache. The gateway's rate limit and the agent's daily cap are\ndeliberately separate: a limit you can bypass by reaching the agent directly is not a limit,\nso the spend gate lives next to the spending.\n\nParsing is page-aware: a chunk never crosses a PDF page or a Markdown section, one chunk per\npage or section slice. Same-page chunks retrieved together merge into one source with a locator\n(page or heading), and the snippet is the whole merged chunk text — the recall check keys on page\nmatch and the grounding check keys on `docId` plus locator, top 5 only, so a query-chosen passage\nwould fail both. Deep search owns its own cap: it reserves one of `DEEP_DAILY_CAP` (5) credits per\nuser per UTC day before anything else runs, atomically, in a `deepQuota` collection; the credit is\nrefunded only if planning fails before any retrieval starts. The quick loop's research phase\n(opener, preflight, tool loop) now lives in one shared function, `loop/research.ts`, that both\ngears call; quick behavior is unchanged.",
+    "communication": "Browser to gateway: HTTPS, and SSE for answers, with compression off and every event flushed.\nGateway to agent: HTTP over Fly's private network, the SSE stream proxied event by event; the\ngateway forwards `X-Request-Id` so one id correlates both services' logs. Agent to providers:\nHTTPS with a per-call timeout inside the gear's wall clock. Agent to worker: the `jobs`\ncollection, claimed with an atomic update and a lease, polled every two seconds; no queue\nbroker. When a provider throws before headers are sent, the answer is a `502`; after headers,\nthe stream ends with an `error` event and `terminated: \"error\"`, never a plausible answer.\nWhen the agent is down the gateway returns `502` and `/health` says so rather than inventing\nprovider names. When the worker is down, uploads still return `202` and documents stay\nvisibly `pending`; nothing is lost because the job row is the record. The worker stays inside\nthe agent app rather than a separate Fly app: see Trade-offs.\n\nDocs mode answers straight from the preflight document search when it found anything; the model\nmay request at most `DOCS_EXTRA_SEARCHES` (1) more, enforced in the loop and stated in the trace\n`reason`. That change took docs-mode TTFT p95 from 12.35 s to 1.62 s, because every recall hit\nhad already come from the preflight search.\n\nAuto mode with a Space attached searches the Space first as well, and since v1.5 it also\nanswers straight from that search when it found anything. Until then auto kept its model turn\nso the model could add the web; on the bench's mode=auto probe the model spent that turn on a\nfetch of a doc source (rejected in 0 ms, doc sources have no URL), a web search and a page\nfetch before answering: TTFT 6.9 s and 9.4 s in the two deployed runs of 2026-09-15, against\n0.4–1.0 s for the same question in docs mode. Gate 2 of the provided eval is a five-query smoke\nwhose p95 is its slowest query, and it blocks every later gate, so that one turn failed the\ngrader's path outright. Empty retrieval keeps the turn in both modes.\n\nWeb mode now follows the same rule on a fresh thread: when the preflight search returns page\ntext for at least two results (`WEB_PREFLIGHT_MIN_SOURCES`), the loop goes straight to\nsynthesis. Before the change, 25 quick web runs showed the cold search at 1.3–2.9 s, each\nresearch turn about 2 s, and a median of one extra fetch — TTFT 4.7–13 s against the 2.5 s p95\ngate. After it, ten cold questions ran 1.8–3.6 s TTFT (median 2.4 s) and ten warm repeats\n0.6–0.9 s, at $0.011–0.012 cold and $0.003–0.004 warm. What remains is Tavily itself:\n1.0–2.3 s on a cold query whether or not raw content is requested (measured both ways, five\nqueries each), plus about 0.7 s to the synthesis call's first token. With half the bench\nworkload repeated, the bench's p95 lands on a cold query, so we expect about 3 s against the\n2.5 s gate, and the miss is documented on `/evals` rather than bought with a looser cap. Under\nthe threshold — one page of text, or none — the model keeps its turn, to fetch or reformulate.\nFollow-ups keep theirs too, and deep sub-questions always do.\n\n\"Fresh thread\" turned out to be the wrong gate. The first full bench (2026-09-14 evening) sends\nall 40 web queries down one thread, so 39 of them took the research turn: TTFT p95 12.8 s, the\nanswer p95 15.0 s, and a 10% search cache hit rate because the model rephrased every search.\nThe rule is now \"fresh thread, or a question that stands on its own\" (`loop/standalone.ts`):\nfewer than four words, a continuation opener (\"And …\", \"What about …\"), or a pronoun in the\nopening words or as the last word marks a follow-up, and everything else preflights on the\nuser's words. A wrong \"standalone\" costs one search and some off-topic passages next to the\nhistory the synthesis always sees; a wrong \"follow-up\" costs the model turn every follow-up paid\nbefore. All 20 bench questions pass the check, pronouns in the middle included; the twelve\nfollow-up shapes in `test/standalone.test.ts` do not. The lesson: measure with the grader's\nharness, not only your own — `ask.py` opened a thread per question, and the bench does not.\n\nThe same bench failed every memory gate, for the mirror-image reason: the fast path takes the\nmodel's turn away, and `save_memory` and `recall_memory` were tools only a model turn could\ncall. Two changes. An instruction about the user (\"Remember this preference for all future\nanswers: …\", `looksLikeMemoryRequest`) is not searched and keeps its model turn, which is\noffered `save_memory`. And every quick run now recalls memory as its FIRST step, a real\n`recall_memory` trace step the loop makes itself (one embedding, one Mongo scan, about\n100 ms), whose lines go into the synthesis system prompt — so a preference saved in one thread\nreaches the answer in the next without a model turn spent asking for it. A side effect worth\nnaming: the stream now always opens with that trace, so a model-provider failure on the first\ncall surfaces as the stream's `error` event rather than a 502 response.\n\nCitation grounding was the third miss (0.913, gate 0.95), and the audit\n(`scripts-local/grounding-audit.mjs`, which re-scores stored answers with the bench's own\nmatcher) put the failures in three bins. Nine snippets began with markdown the grader's\ntag-stripped HTML never contains — `[Previous](/learn/bm25)`, `![](…)`, `# Heading` — because\nTavily's raw content is markdown; `cleanRawContent` in the provider now keeps the link text\nand drops the syntax. Four were YouTube pages, whose \"text\" is a transcript the HTML does not\ncarry; video and login-walled hosts are no longer citable sources. The rest were short\nsnippets with one token the page serves as an entity (`isn&rsquo;t`), so `SNIPPET_MIN` rose\nfrom 40 to 160 characters to leave a clean 12-token run on one side of any such token.\n\nTwo more from the third bench. The search cache holds results for six hours, so a cleaning\nthat lives only in the provider does nothing for a cached row: the web-search tool cleans\nagain as it registers a result. And a rendered formula is text we were given but never text\nthe grader's tag-stripper produces, so the passage chooser skips any sentence with more than\n8% of its characters outside plain prose (`looksLikeMarkup`). The gateway had its own defect:\nit mirrored the agent's bodiless 204 on DELETE /memory/:id as a \"non-JSON body\" 502, which\nfailed all three memory gates on a save and a recall that had in fact worked.\n\nThe remaining TTFT outliers were the queries whose search extracted text for fewer than two\nresults: the model's turn went one way every time (fetch the unread page), at 7.9 and 8.9 s\nagainst 0.7 s for the other 38. The loop now fetches up to `WEB_PREFLIGHT_FETCHES` (2) such\nresults itself, as visible `fetch_page` steps, and skips the turn once the threshold is met;\na failed fetch is a failed step and the model keeps its turn as before.\n\nDeep search sends its `plan` frame as the first paint, before any retrieval. The planner prompt\nis deliberately terse — fifteen-word questions, six-word reasons — because output tokens are the\nlatency: 330–400 tokens measured at 3.0–4.9 s, about 245 tokens at 2.4–3.5 s, against a 4 s gate.\nSub-questions then fan out over a pool of `DEEP_CONCURRENCY` (3), sharing one source registry, one\ntool-call ledger (cap 24, in-flight calls counted), and one wall clock (240 s). Each sub-question\npreflights its own search and gets a per-sub budget derived from the plan size, so the shared cap\nis never hit on finished work — six sub-questions get three calls each, five or fewer get four. A\nfailure in one sub-question aborts the others and ends the stream with an `error` frame. Merge is\nfree because there is one registry: one citation numbering, dedupe by url or `docId`+locator, each\nsource credited to the sub-question that found it first. Synthesis reads up to 4 passages per\nsub-question, 20 total, grouped under the sub-question that found them, and writes a direct\nanswer, one section per sub-question, then \"What is still unknown.\"",
+    "state": "Atlas is authoritative for everything a user would miss: threads, messages, memories with\ntheir embeddings, spaces, documents, chunks, and the `requests` ledger that `/stats`\nreconciles against. GridFS holds the uploaded originals. Two things are caches you could\ndelete: the in-process LRU and the Mongo `searchCache` collection (keyed by a hash of\nnormalized query plus provider, six-hour TTL). Run logs are derived from `requests` but are\nkept as files because the quality gate reads them. The consistency story for a document: it\nis `pending` when the `202` returns, `parsing` and `embedding` while the worker works, and\n`indexed` only after the worker queries the vector index for a chunk it just wrote and gets\nit back; until then a search of that Space says the document is not yet searchable instead\nof silently returning nothing. Atlas Search is eventually consistent, so the probe retries\nwith backoff and the document fails loudly if it never becomes visible. Atlas Search lags\nwrites by about 3 s, so the worker waits for the probe rather than trusting the write. GridFS\nuses one bucket per process, with indexes ensured at boot; without that, the first upload of a\nprocess paid about 456 ms for driver index checks. `deepQuota` rows carry a TTL and expire two\nto three days after the day they govern. `/stats.deepToday` counts request rows and is a\nreport; the quota collection is the gate, and the two can differ by refunded planning failures.",
+    "tradeoffs": "1. **Anthropic direct with Claude Haiku 4.5 instead of OpenRouter with GLM-4.6.** We are\n   doing this for simplicity and speed. One vendor, one key, one SDK, and a model whose\n   behavior on tool use and citations we already know, so the first working loop arrives\n   sooner and debugging stays inside one system. Haiku 4.5 clears the graded cost gate of five\n   cents per quick answer with room to spare, and first-party prompt caching keeps the system\n   prompt and tool definitions cheap across a multi-step loop. Given up: the shared-model\n   comparison with the Codex build, and the lower per-token price of an open-weight model on a\n   pinned OpenRouter endpoint. That earlier plan (OpenRouter, `z-ai/glm-4.6` at one pinned\n   provider, reasoning off) is recorded on the board as D-10 and stays a candidate for a later\n   refactor once the build is stable; the provider call sits behind one module so the swap is\n   contained.\n2. **Atlas Vector Search instead of a dedicated vector store.** One document per citation and\n   no second system to keep consistent, at the cost of the M0 three-index limit, which is why\n   each build needs its own cluster.\n3. **Worker as a child process on the agent Machine instead of a separate app.** Fewer moving\n   parts and one deploy, at the cost of CPU contention during a large PDF and the risk that\n   Fly stops a private Machine with jobs still pending. Chosen for simplicity; the bench is\n   the tripwire. If it shows quick-search latency spikes during indexing, the worker becomes a\n   separate app, and nothing in the job protocol has to change because the `jobs` collection\n   is already the only interface between them.\n4. **Measured tokens times published rates instead of a flat rate table.** `costUsd` is\n   computed per call from the usage block Anthropic returns on every response (input, output,\n   cache-write and cache-read tokens, each at its own rate for Haiku 4.5) and summed across\n   the loop, so the graded number tracks what was billed, cache discounts included. Given up:\n   the simplicity of the starter's `sla.json` price table, which stays as the documented\n   fallback when a response carries no usage. The rates live in one config file with the model\n   id, so a later model swap changes one place.\n5. **Quick as the default with no server-side upgrade** is a requirement, not a trade-off,\n   but it costs something real: a user who asks a deep question in quick mode gets a shallow\n   answer, and the UI toggle is the only remedy.\n6. **No re-rank step after hybrid retrieval.** Reciprocal rank fusion over Atlas Vector Search\n   and Atlas Search already put every gold answer in the top 5 (recall@5 39/39 on the gold set),\n   so a re-ranker would add a model turn — about 2 s on Haiku — for no measured gain. Given up:\n   headroom against a harder or larger corpus than the gold set covers.\n7. **The gateway rate limit is 300 requests per minute**, not the code default of 30, set by\n   `RATE_LIMIT_PER_MINUTE` for the bench and the deployed gateway. The bench's own status\n   polling during ingest would have tripped 30; the code default stays conservative for a\n   deployment the bench doesn't drive. Measured week 2 numbers (Atlas, real providers): recall@5\n   39/39; upload 202 accept 181–212 ms (gate p95 300); docs TTFT p95 1.62 s; docs cost $0.002 per\n   answer; deep on the four bench questions: plan 2.4–3.5 s, distinct sources 2.7–7.0× the quick\n   run of the same question (gate 2.0×), cost $0.086–0.137 (gate $0.35), wall clock 32–48 s (gate\n   90 s); deep during a 60-page ingest ran in 31.8 s versus 47.9 s idle, and the document itself\n   indexed in 11.9 s.\n8. **Source numbers are assigned on first registration and never reassigned**, so the visible\n   list can have gaps when a search result was never fetched. Kept on purpose: the research model\n   already saw those numbers in tool results, and a stable number is worth more than a\n   contiguous one.\n9. **Two models, split by where the difference shows: Haiku 4.5 for planning, research and the\n   quick answer; Sonnet 5 for the deep answer only** (`LLM_MODEL_SYNTHESIS_DEEP`; Kurt,\n   2026-09-14, from an A/B of twelve questions per arm). Sonnet on the quick answer added\n   0.3–1.2 s to first token on a 2.5 s gate already missed, and tripled the answer's cost\n   ($0.008–0.013 vs $0.003–0.004 warm) for prose a reader could not tell apart; on the docs\n   answers both arms hit all five gold facts. On the deep answer Sonnet cited 13–14 of the\n   sources against Haiku's 7–9, wrote sections that read as one argument, and put the citation\n   after the claim rather than before it, for 12–20% more cost ($0.080–0.093 vs $0.072–0.077,\n   cap $0.35) behind a plan frame that is Haiku's either way, so deep first paint does not move.\n   Each LLM call is priced against the model that made it, so a mixed run bills honestly, and\n   `/health` names every model that can write an answer. Given up: one cache namespace across\n   the run (caches are model-scoped; the deep synthesis prompt is unique per run anyway)."
+  },
+  "gates": [
+    {
+      "gate": 0,
+      "name": "STATIC",
+      "status": "pass",
+      "detail": "lint, typecheck and git clean"
+    },
+    {
+      "gate": 1,
+      "name": "CONTRACT",
+      "status": "pass",
+      "detail": "C1: expectations.json is coherent",
+      "exitCode": 1
+    },
+    {
+      "gate": 2,
+      "name": "RUN",
+      "status": "pass",
+      "detail": "five queries completed inside budget",
+      "exitCode": 0
+    },
+    {
+      "gate": 3,
+      "name": "TRAJECTORY",
+      "status": "pass",
+      "detail": "91 run log(s), no error-severity trajectory failure (A3 warns)",
+      "exitCode": 1
+    },
+    {
+      "gate": 4,
+      "name": "EVAL",
+      "status": "fail",
+      "detail": "SLA: at least one target missed · E1 gold set: pass · E2 thresholds: pass",
+      "exitCode": 1
+    }
+  ],
+  "rubric": {
+    "total": 100,
+    "awarded": 82,
+    "automated": [
+      {
+        "id": "ui_lights_up_contract",
+        "label": "UI lights up & contract",
+        "points": 10,
+        "awarded": 10,
+        "status": "pass",
+        "evidence": "✓ contract probes (401/404/400): GET /memory without X-User-Id: 401 · GET /threads/thr_nope (unknown id): 404 · POST /threads/thr_x/ask with an empty body: 400 · GET /evals/report.json without X-User-Id: 404 · ✓ sources before the first token: every answer sent its sources event before its first token · ✓ /health names model, provider, store: /health names claude-haiku-4-5; deep synthesis: claude-sonnet-5 · tavily · atlas-vector-search · db ok",
+        "rules": [
+          "C1"
+        ]
+      },
+      {
+        "id": "search_cited_answers",
+        "label": "Search & cited answers",
+        "points": 20,
+        "awarded": 20,
+        "status": "pass",
+        "evidence": "✓ citation grounding >= 0.95: citation grounding 0.966 over 206 verifiable citations, 0 dangling · ✓ retrieval rate = 1.0: retrieval rate 1 — the share of answers whose run actually searched · ✓ search cache hits on repeats: search cache hit rate 100% on a workload that is 50% repeats",
+        "rules": [
+          "E2"
+        ]
+      },
+      {
+        "id": "memory",
+        "label": "Memory (thread + long-term)",
+        "points": 10,
+        "awarded": 10,
+        "status": "pass",
+        "evidence": "✓ save_memory lands in GET /memory: GET /memory lists 1 new row after the save and the trace shows save_memory · ✓ recall crosses into a new thread: a new thread's trace carries 1 recall_memory step(s) · ✓ DELETE removes it: DELETE /memory/mem_mu2lpilbpx974m removed the row",
+        "rules": []
+      },
+      {
+        "id": "rag_documents",
+        "label": "RAG over documents",
+        "points": 15,
+        "awarded": 15,
+        "status": "pass",
+        "evidence": "✓ 202 accept p95 < 300ms: 202 accept p95 80ms · ✓ reaches indexed via the worker: 4/4 corpus file(s) reached indexed after a 202 · ✓ citation carries a page locator: 79 document citation(s) carry a page locator, e.g. p. 1 · ✓ mode=auto picks documents: mode=auto retrieved from the Space — \"mode=auto: a Space is attached, search it first\" · ✓ recall@5 >= 0.7: recall@5 1 over 30 gold questions",
+        "rules": [
+          "E1",
+          "E2"
+        ]
+      },
+      {
+        "id": "deep_search",
+        "label": "Deep search (plan, fan-out, merged citations, spend gate)",
+        "points": 15,
+        "awarded": 15,
+        "status": "pass",
+        "evidence": "✓ plan streamed before any retrieval: 4/4 deep runs planned >= 3 sub-questions, 4/4 streamed the plan before retrieving anything · ✓ every step and source tagged with its sub-question: all 4 deep runs tag every retrieval step and every source with its subQuestion · ✓ deep reads more than quick: worst deep/quick distinct-source ratio 4.20x (need 2x) · ✓ deep stays inside its budget: 0 deep run(s) over $0.35, 0 over 24 tool calls · ✓ quick never escalates to plan_research (R2): 75 quick run(s), none called plan_research · ✓ deep cap+1 returns 429 with resetsAt: request 6 of a 5/day deep cap returned 429 with resetsAt 2026-09-16T00:00:00.000Z",
+        "rules": [
+          "E2",
+          "B3",
+          "R2"
+        ]
+      },
+      {
+        "id": "performance_sla",
+        "label": "Performance & SLA gate",
+        "points": 10,
+        "awarded": 7,
+        "status": "partial",
+        "evidence": "✗ bench.mjs exits 0: 1 SLA target(s) missed",
+        "rules": [
+          "B1",
+          "B2",
+          "B3",
+          "A2",
+          "A3"
+        ]
+      },
+      {
+        "id": "observability",
+        "label": "Logging, tracing & stats",
+        "points": 5,
+        "awarded": 5,
+        "status": "pass",
+        "evidence": "✓ one X-Request-Id correlates both logs: 71/71 answers returned an X-Request-Id to correlate the two logs · ✓ /stats reconciles with the run: /stats.answers=468 against 71 answers this run · ✓ every failed tool call carries an error (A1): A1: 199 run(s)",
+        "rules": [
+          "A1"
+        ]
+      }
+    ],
+    "manual": [
+      {
+        "id": "deep_search_quality",
+        "label": "Deep search quality (human half)",
+        "points": 5,
+        "awarded": 0,
+        "status": "manual",
+        "evidence": "a grader asks the same question at both depths and reads both answers. The deep one has to be BETTER, not merely longer: broader coverage, sources the quick answer missed, sub-questions a person would actually have asked, and no padding. Judged by a person, never a model",
+        "rules": [
+          "E3",
+          "P1"
+        ]
+      },
+      {
+        "id": "human_gate_answer_quality",
+        "label": "Human gate & answer quality",
+        "points": 5,
+        "awarded": 0,
+        "status": "manual",
+        "evidence": "/evals renders one successful and one failing trajectory in full, every step, with what each taught the learner; grader reads five sampled answers for concision, relevance, and honesty when retrieval is thin",
+        "rules": [
+          "P1"
+        ]
+      },
+      {
+        "id": "deploy_docs",
+        "label": "Deploy & docs",
+        "points": 5,
+        "awarded": 0,
+        "status": "manual",
+        "evidence": "UI deployed on Vercel (the submitted URL) with /evals rendering GET /evals/report.json from this run; services on Fly.io or Vercel against an Atlas cluster; agent service not publicly reachable; no key or connection string reachable from the browser; the design section (five questions) and run notes render on the page",
+        "rules": []
+      }
+    ],
+    "redLines": [
+      {
+        "check": "no fabricated citation in the bench sample (E2)",
+        "ok": true,
+        "detail": "0 citation(s) resolved to nothing retrieved in that request"
+      },
+      {
+        "check": "no run that hit a cap reported as terminated=done (A2)",
+        "ok": true,
+        "detail": "199 run(s)"
+      },
+      {
+        "check": "plan_research never called from a quick search: depth is opted into, never drifted into (R2)",
+        "ok": true,
+        "detail": "75 quick run(s), none called plan_research"
+      },
+      {
+        "check": "no 2xx answer served on a provider exception (A1)",
+        "ok": true,
+        "detail": "199 run(s)"
+      }
+    ]
+  },
+  "bench": {
+    "ranAt": "2026-09-15T11:41:20.607Z",
+    "target": "https://lumina-claude-gateway.fly.dev",
+    "pass": false,
+    "sla": [
+      {
+        "metric": "ttft p95",
+        "target": 2500,
+        "actual": 1217,
+        "unit": "ms",
+        "comparator": "<=",
+        "pass": true
+      },
+      {
+        "metric": "answer p95",
+        "target": 12000,
+        "actual": 5038,
+        "unit": "ms",
+        "comparator": "<=",
+        "pass": true
+      },
+      {
+        "metric": "202 accept p95",
+        "target": 300,
+        "actual": 89,
+        "unit": "ms",
+        "comparator": "<=",
+        "pass": true
+      },
+      {
+        "metric": "search p95 during ingest / idle",
+        "target": 1.3,
+        "actual": 0.769,
+        "unit": "×",
+        "comparator": "<=",
+        "pass": true
+      },
+      {
+        "metric": "recall@5",
+        "target": 0.7,
+        "actual": 1,
+        "unit": "",
+        "comparator": ">=",
+        "pass": true
+      },
+      {
+        "metric": "search cache hit rate",
+        "target": 50,
+        "actual": 100,
+        "unit": "%",
+        "comparator": ">=",
+        "pass": true
+      },
+      {
+        "metric": "deep plan p95",
+        "target": 4000,
+        "actual": 4045,
+        "unit": "ms",
+        "comparator": "<=",
+        "pass": false
+      },
+      {
+        "metric": "deep answer p95",
+        "target": 90,
+        "actual": 85.9,
+        "unit": "s",
+        "comparator": "<=",
+        "pass": true
+      },
+      {
+        "metric": "deep sub-questions (min)",
+        "target": 3,
+        "actual": 4,
+        "unit": "",
+        "comparator": ">=",
+        "pass": true
+      },
+      {
+        "metric": "deep/quick source ratio (min)",
+        "target": 2,
+        "actual": 4.2,
+        "unit": "×",
+        "comparator": ">=",
+        "pass": true
+      },
+      {
+        "metric": "cost per deep answer",
+        "target": 0.35,
+        "actual": 0.1433,
+        "unit": "$",
+        "comparator": "<=",
+        "pass": true
+      },
+      {
+        "metric": "citation grounding",
+        "target": 0.95,
+        "actual": 0.966,
+        "unit": "",
+        "comparator": ">=",
+        "pass": true
+      },
+      {
+        "metric": "error rate",
+        "target": 0.01,
+        "actual": 0,
+        "unit": "",
+        "comparator": "<=",
+        "pass": true
+      },
+      {
+        "metric": "cost per answer (quick)",
+        "target": 0.05,
+        "actual": 0.0031,
+        "unit": "$",
+        "comparator": "<=",
+        "pass": true
+      },
+      {
+        "metric": "sources before the first token",
+        "target": 1,
+        "actual": 1,
+        "unit": "",
+        "comparator": ">=",
+        "pass": true
+      },
+      {
+        "metric": "citations with no matching source",
+        "target": 0,
+        "actual": 0,
+        "unit": "",
+        "comparator": "<=",
+        "pass": true
+      }
+    ],
+    "citationGrounding": 0.9660194174757282,
+    "recallAt5": 1,
+    "retrievalRate": 1,
+    "errorRate": 0,
+    "latency": {
+      "ttftP50Ms": 731,
+      "ttftP95Ms": 1217,
+      "answerP50Ms": 2871,
+      "answerP95Ms": 5038,
+      "accept202P95Ms": 89
+    },
+    "cost": {
+      "meanCostPerAnswerUsd": 0.0030718533333333334,
+      "meanCostPerDeepAnswerUsd": 0.1432805,
+      "declaredPriceTableUsd": 0.026357721518987343,
+      "projectedMonthlyUsd": 1709.2718000000004,
+      "projectedMonthlyNoCacheUsd": 1107.1853333333333
+    },
+    "searchCacheHitRatePct": 100,
+    "answers": 79
+  },
+  "quality": {
+    "project": "Claude_Build",
+    "checkedAt": "2026-09-15T11:42:58.161Z",
+    "runs": 199,
+    "errors": 0,
+    "warnings": 2,
+    "results": [
+      {
+        "id": "C1",
+        "title": "Declared expectations are internally coherent",
+        "severity": "error",
+        "status": "pass",
+        "detail": "contract coherent"
+      },
+      {
+        "id": "A1",
+        "title": "Tool errors surface as errors",
+        "severity": "error",
+        "status": "pass",
+        "detail": "199 run(s)"
+      },
+      {
+        "id": "A2",
+        "title": "The loop terminates because it finished",
+        "severity": "error",
+        "status": "pass",
+        "detail": "199 run(s)"
+      },
+      {
+        "id": "A3",
+        "title": "No tool thrash",
+        "severity": "warn",
+        "status": "fail",
+        "detail": "req_2679c3a8-fd6: \"fetch_page\" called 5x consecutively (cap 4); req_3e04ee3a-49d: \"fetch_page\" called 5x consecutively (cap 4); req_4303a4e2-b91: \"fetch_page\" called 6x consecutively (cap 4); req_5bd9f088-59f: \"fetch_page\" called 8x consecutively (cap 4); req_70536ae0-0f0: \"fetch_page\" called 6x consecutively (cap 4); req_777ec444-698: \"fetch_page\" called 7x consecutively (cap 4); req_b4cbfc27-3e1: \"fetch_page\" called 6x consecutively (cap 4); req_b7b17d13-097: \"fetch_page\" called 5x consecutively (cap 4)"
+      },
+      {
+        "id": "R1",
+        "title": "Required tools were actually called",
+        "severity": "error",
+        "status": "skip",
+        "detail": "none declared"
+      },
+      {
+        "id": "R2",
+        "title": "Forbidden tools were not called",
+        "severity": "error",
+        "status": "skip",
+        "detail": "none declared"
+      },
+      {
+        "id": "E1",
+        "title": "A gold set exists and is non-trivial",
+        "severity": "error",
+        "status": "pass",
+        "detail": "39 items"
+      },
+      {
+        "id": "E2",
+        "title": "Declared eval thresholds are met",
+        "severity": "error",
+        "status": "pass",
+        "detail": "4 threshold(s) met"
+      },
+      {
+        "id": "E3",
+        "title": "A judge model may report, never block",
+        "severity": "warn",
+        "status": "manual",
+        "detail": "confirm no error-severity rule derives its verdict from a model"
+      },
+      {
+        "id": "B1",
+        "title": "Token budget respected",
+        "severity": "error",
+        "status": "pass",
+        "detail": "199 run(s)"
+      },
+      {
+        "id": "B2",
+        "title": "Latency budget respected",
+        "severity": "warn",
+        "status": "pass",
+        "detail": "199 run(s)"
+      },
+      {
+        "id": "B3",
+        "title": "Cost budget respected",
+        "severity": "warn",
+        "status": "pass",
+        "detail": "199 run(s)"
+      },
+      {
+        "id": "P1",
+        "title": "A human read a full trajectory",
+        "severity": "info",
+        "status": "manual",
+        "detail": "name the successful and failing trajectories you read end to end"
+      },
+      {
+        "id": "P2",
+        "title": "Every rule cites a real precedent",
+        "severity": "warn",
+        "status": "fail",
+        "detail": "10 rule(s) still lack a real precedent: C1, A2, A3, R1, R2, E1, E2, B1, B2, B3"
+      }
+    ]
+  },
+  "trajectories": {
+    "successful": {
+      "requestId": "req_b4cbfc27-3e1",
+      "terminated": "done",
+      "steps": [
+        {
+          "step": 1,
+          "tool": "plan_research",
+          "ok": true,
+          "ms": 2179
+        },
+        {
+          "step": 2,
+          "tool": "web_search",
+          "ok": true,
+          "ms": 1733
+        },
+        {
+          "step": 3,
+          "tool": "web_search",
+          "ok": true,
+          "ms": 1949
+        },
+        {
+          "step": 4,
+          "tool": "web_search",
+          "ok": true,
+          "ms": 2434
+        },
+        {
+          "step": 5,
+          "tool": "fetch_page",
+          "ok": true,
+          "ms": 610
+        },
+        {
+          "step": 6,
+          "tool": "fetch_page",
+          "ok": true,
+          "ms": 828
+        },
+        {
+          "step": 7,
+          "tool": "fetch_page",
+          "ok": true,
+          "ms": 634
+        },
+        {
+          "step": 8,
+          "tool": "fetch_page",
+          "ok": true,
+          "ms": 738
+        },
+        {
+          "step": 9,
+          "tool": "fetch_page",
+          "ok": true,
+          "ms": 959
+        },
+        {
+          "step": 10,
+          "tool": "fetch_page",
+          "ok": true,
+          "ms": 227
+        },
+        {
+          "step": 11,
+          "tool": "web_search",
+          "ok": true,
+          "ms": 974
+        },
+        {
+          "step": 12,
+          "tool": "web_search",
+          "ok": true,
+          "ms": 1096
+        },
+        {
+          "step": 13,
+          "tool": "web_search",
+          "ok": true,
+          "ms": 1378
+        },
+        {
+          "step": 14,
+          "tool": "fetch_page",
+          "ok": true,
+          "ms": 291
+        },
+        {
+          "step": 15,
+          "tool": "fetch_page",
+          "ok": true,
+          "ms": 442
+        },
+        {
+          "step": 16,
+          "tool": "fetch_page",
+          "ok": false,
+          "ms": 687,
+          "error": "page too large (3334809 bytes > 1500000) for https://techdocs.akamai.com/property-mgr/docs/websockets-support"
+        },
+        {
+          "step": 17,
+          "tool": "web_search",
+          "ok": true,
+          "ms": 1349
+        },
+        {
+          "step": 18,
+          "tool": "web_search",
+          "ok": true,
+          "ms": 2149
+        },
+        {
+          "step": 19,
+          "tool": "fetch_page",
+          "ok": true,
+          "ms": 571
+        }
+      ],
+      "notes": "TODO — what did reading this run end to end teach you? Replace this line; a grader reads it."
+    },
+    "failing": {
+      "requestId": "req_793296f3-0fe",
+      "terminated": "error",
+      "steps": [
+        {
+          "step": 1,
+          "tool": "web_search",
+          "ok": true,
+          "ms": 982
+        }
+      ],
+      "notes": "TODO — what did reading this run end to end teach you? Replace this line; a grader reads it."
+    }
+  }
+}

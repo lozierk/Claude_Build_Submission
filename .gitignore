@@ -1,0 +1,20 @@
+node_modules/
+dist/
+web/dist/
+.env
+.env.*
+!.env.example
+runs/
+reports/
+*.log
+.DS_Store
+
+# deploy artefacts (Vercel link + prebuilt static UI copy)
+.vercel/
+deploy/web/
+runs.local-*/
+
+# public snapshot: the served report is evidence, keep it
+!reports/
+reports/*
+!reports/latest.json
